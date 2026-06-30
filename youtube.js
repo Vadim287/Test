@@ -1,110 +1,562 @@
 (function () {
-  'use strict';
+    'use strict';
 
-  var ID = 'youtube';
+    if (window.youtube_dual_plugin_installed) return;
+    window.youtube_dual_plugin_installed = true;
 
-  var PIPED = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.adminforge.de',
-    'https://pipedapi.syncpundit.io'
-  ];
+    var BACKEND_INSTANCES = {
+        piped: [
+            'https://pipedapi.kavin.rocks',
+            'https://pipedapi.adminforge.de',
+            'https://pipedapi.syncpundit.io'
+        ],
+        invidious: [
+            'https://inv.nadeko.net'
+        ]
+    };
 
-  var INVIDIOUS = [
-    'https://inv.nadeko.net'
-  ];
+    var STORAGE_BACKEND = 'youtube_backend_mode';
+    var STORAGE_PIPED_CUSTOM = 'youtube_piped_custom';
+    var STORAGE_INVIDIOUS_CUSTOM = 'youtube_invidious_custom';
+    var STORAGE_REGION = 'youtube_region';
+    var STORAGE_QUALITY = 'youtube_quality';
+    var STORAGE_CACHE_SIZE = 'youtube_cache_size';
+    var STORAGE_CACHE_STORE = 'youtube_cache_store_v1';
+    var STORAGE_HISTORY = 'youtube_history';
+    var STORAGE_FAVORITES = 'youtube_favorites';
+    var STORAGE_SUBSCRIPTIONS = 'youtube_subscriptions';
+    var STORAGE_PLAYLISTS = 'youtube_playlists_local';
+    var STORAGE_LAST_WATCHED = 'youtube_last_watched';
 
-  var STORE = {
-    settings: ID + '_settings',
-    cache: ID + '_cache',
-    history: ID + '_history',
-    fav: ID + '_fav',
-    subs: ID + '_subs'
-  };
+    var CACHE_TTL = 5 * 60 * 1000;
+    var REQUEST_TIMEOUT = 10000;
+    var RETRIES_PER_INSTANCE = 3;
 
-  var DEFAULT = {
-    backend: 'auto',
-    piped_i: 0,
-    inv_i: 0,
-    quality: 'auto'
-  };
+    function nowTime() { return new Date().getTime(); }
 
-  function ls_get(k, d) {
-    try {
-      var v = localStorage.getItem(k);
-      return v ? JSON.parse(v) : d;
-    } catch (e) {
-      return d;
+    function loadCacheStore() {
+        try {
+            var raw = Lampa.Storage.get(STORAGE_CACHE_STORE, '{}');
+            var parsed = JSON.parse(raw);
+            return parsed && typeof parsed === 'object' ? parsed : {};
+        } catch (e) {
+            return {};
+        }
     }
-  }
 
-  function ls_set(k, v) {
-    try {
-      localStorage.setItem(k, JSON.stringify(v));
-    } catch (e) {}
-  }
+    function saveCacheStore(store) {
+        try {
+            Lampa.Storage.set(STORAGE_CACHE_STORE, JSON.stringify(store));
+        } catch (e) {}
+    }
 
-  function settings() {
-    return Object.assign({}, DEFAULT, ls_get(STORE.settings, {}));
-  }
+    function cacheGet(key) {
+        var store = loadCacheStore();
+        var entry = store[key];
+        if (!entry) return null;
+        if (nowTime() - entry.t > CACHE_TTL) {
+            delete store[key];
+            saveCacheStore(store);
+            return null;
+        }
+        return entry.d;
+    }
 
-  function set_settings(v) {
-    ls_set(STORE.settings, v);
-  }
+    function cacheSet(key, data) {
+        var store = loadCacheStore();
+        store[key] = { t: nowTime(), d: data };
+        var keys = Object.keys(store);
+        var limit = parseInt(Lampa.Storage.get(STORAGE_CACHE_SIZE, '50'), 10) || 50;
+        if (keys.length > limit) {
+            keys.sort(function (a, b) { return store[a].t - store[b].t; });
+            while (keys.length > limit) {
+                var k = keys.shift();
+                delete store[k];
+            }
+        }
+        saveCacheStore(store);
+    }
 
-  function cache_get() {
-    return ls_get(STORE.cache, {});
-  }
+    function cacheReset() {
+        saveCacheStore({});
+    }
 
-  function cache_set(v) {
-    ls_set(STORE.cache, v);
-  }
+    function jsonList(key, def) {
+        var raw = Lampa.Storage.get(key, '');
+        if (!raw) return def || [];
+        try {
+            var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (!parsed || !parsed.length) return def || [];
+            return parsed;
+        } catch (e) {
+            return def || [];
+        }
+    }
 
-  function history_add(v) {
-    var h = ls_get(STORE.history, []);
-    h.unshift(v);
-    h = h.slice(0, 300);
-    ls_set(STORE.history, h);
-  }
+    function jsonSave(key, value) {
+        Lampa.Storage.set(key, JSON.stringify(value));
+    }
 
-  function fav_toggle(v) {
-    var f = ls_get(STORE.fav, []);
-    var i = f.findIndex(function (x) { return x.id === v.id; });
-    if (i >= 0) f.splice(i, 1);
-    else f.push(v);
-    ls_set(STORE.fav, f);
-  }
+    function jsonObj(key, def) {
+        var raw = Lampa.Storage.get(key, '');
+        if (!raw) return def || null;
+        try {
+            return JSON.parse(raw);
+        } catch (e) {
+            return def || null;
+        }
+    }
 
-  function subs_toggle(v) {
-    var s = ls_get(STORE.subs, []);
-    var i = s.findIndex(function (x) { return x.id === v.id; });
-    if (i >= 0) s.splice(i, 1);
-    else s.push(v);
-    ls_set(STORE.subs, s);
-  }
+    function getInstances(backend) {
+        var custom_key = backend === 'piped' ? STORAGE_PIPED_CUSTOM : STORAGE_INVIDIOUS_CUSTOM;
+        var custom = Lampa.Storage.get(custom_key, '');
+        var list = [];
+        if (custom) list.push(custom.replace(/\/+$/, ''));
+        var defaults = BACKEND_INSTANCES[backend] || [];
+        for (var i = 0; i < defaults.length; i++) {
+            if (list.indexOf(defaults[i]) === -1) list.push(defaults[i]);
+        }
+        return list;
+    }
 
-  function timeout(ms) {
-    return new Promise(function (_, r) {
-      setTimeout(function () { r(new Error('timeout')); }, ms);
-    });
-  }
+    function requestOne(base, path, timeout) {
+        return new Promise(function (resolve, reject) {
+            var url = base + path;
+            var xhr = new XMLHttpRequest();
+            var done = false;
+            var timer = setTimeout(function () {
+                if (done) return;
+                done = true;
+                try { xhr.abort(); } catch (e) {}
+                reject(new Error('timeout'));
+            }, timeout);
 
-  async function req(url) {
-    var r = await Promise.race([fetch(url), timeout(12000)]);
-    if (!r.ok) throw new Error('http');
-    return r.json();
-  }
+            try {
+                xhr.open('GET', url, true);
+            } catch (e) {
+                clearTimeout(timer);
+                reject(e);
+                return;
+            }
 
-  function piped() {
-    var s = settings();
-    return PIPED[s.piped_i] || PIPED[0];
-  }
+            xhr.timeout = timeout;
 
-  function inv() {
-    var s = settings();
-    return INVIDIOUS[s.inv_i] || INVIDIOUS[0];
-  }
+            xhr.onload = function () {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try {
+                        resolve(JSON.parse(xhr.responseText));
+                    } catch (e) {
+                        reject(new Error('parse_error'));
+                    }
+                } else {
+                    reject(new Error('http_' + xhr.status));
+                }
+            };
 
-  async function search(q) {
+            xhr.onerror = function () {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                reject(new Error('network_error'));
+            };
+
+            xhr.ontimeout = function () {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                reject(new Error('timeout'));
+            };
+
+            xhr.send();
+        });
+    }
+
+    function tryInstanceWithRetries(base, path, retries) {
+        var chain = Promise.reject(new Error('init'));
+        for (var i = 0; i < retries; i++) {
+            chain = chain.catch(function () {
+                return requestOne(base, path, REQUEST_TIMEOUT);
+            });
+        }
+        return chain;
+    }
+
+    function sequentialTry(items, fn) {
+        var chain = Promise.reject(new Error('init'));
+        items.forEach(function (item) {
+            chain = chain.catch(function () {
+                return fn(item);
+            });
+        });
+        return chain;
+    }
+
+    function buildPath(backend, kind, args) {
+        args = args || {};
+        if (backend === 'piped') {
+            if (kind === 'search') return '/search?q=' + encodeURIComponent(args.q) + '&filter=' + encodeURIComponent(args.filter || 'all');
+            if (kind === 'trending') return '/trending?region=' + encodeURIComponent(args.region || 'US');
+            if (kind === 'streams') return '/streams/' + encodeURIComponent(args.id);
+            if (kind === 'channel') return '/channel/' + encodeURIComponent(args.id);
+            if (kind === 'channel_next') return '/nextpage/channel/' + encodeURIComponent(args.id) + '?nextpage=' + encodeURIComponent(args.nextpage);
+            if (kind === 'playlist') return '/playlists/' + encodeURIComponent(args.id);
+        } else {
+            if (kind === 'search') return '/api/v1/search?q=' + encodeURIComponent(args.q);
+            if (kind === 'trending') return '/api/v1/trending?region=' + encodeURIComponent(args.region || 'US');
+            if (kind === 'streams') return '/api/v1/videos/' + encodeURIComponent(args.id);
+            if (kind === 'channel') return '/api/v1/channels/' + encodeURIComponent(args.id);
+            if (kind === 'channel_next') return '/api/v1/channels/' + encodeURIComponent(args.id) + '/videos?continuation=' + encodeURIComponent(args.nextpage);
+            if (kind === 'playlist') return '/api/v1/playlists/' + encodeURIComponent(args.id);
+        }
+        return '';
+    }
+
+    function backendRequest(backend, kind, args) {
+        var instances = getInstances(backend);
+        var path = buildPath(backend, kind, args);
+        return sequentialTry(instances, function (base) {
+            return tryInstanceWithRetries(base, path, RETRIES_PER_INSTANCE);
+        }).then(function (data) {
+            return { backend: backend, data: data };
+        });
+    }
+
+    function unifiedRequest(kind, args, use_cache) {
+        var cache_key = kind + '|' + JSON.stringify(args || {});
+        if (use_cache !== false) {
+            var cached = cacheGet(cache_key);
+            if (cached) return Promise.resolve(cached);
+        }
+
+        var mode = Lampa.Storage.get(STORAGE_BACKEND, 'auto') || 'auto';
+        var backends = mode === 'auto' ? ['piped', 'invidious'] : [mode];
+
+        return sequentialTry(backends, function (backend) {
+            return backendRequest(backend, kind, args);
+        }).then(function (result) {
+            if (use_cache !== false) cacheSet(cache_key, result);
+            return result;
+        });
+    }
+
+    var Api = {
+        trending: function () {
+            var region = Lampa.Storage.get(STORAGE_REGION, 'US') || 'US';
+            return unifiedRequest('trending', { region: region });
+        },
+        search: function (query) {
+            return unifiedRequest('search', { q: query, filter: 'all' });
+        },
+        channel: function (id) {
+            return unifiedRequest('channel', { id: id });
+        },
+        channelNext: function (id, nextpage) {
+            return unifiedRequest('channel_next', { id: id, nextpage: nextpage }, false);
+        },
+        playlist: function (id) {
+            return unifiedRequest('playlist', { id: id });
+        },
+        streams: function (id) {
+            return unifiedRequest('streams', { id: id });
+        }
+    };
+
+    function pad2(n) {
+        n = Math.floor(n);
+        return n < 10 ? '0' + n : '' + n;
+    }
+
+    function formatDuration(seconds) {
+        seconds = parseInt(seconds, 10);
+        if (!seconds || seconds < 0) return '';
+        var h = Math.floor(seconds / 3600);
+        var m = Math.floor((seconds % 3600) / 60);
+        var s = Math.floor(seconds % 60);
+        if (h > 0) return h + ':' + pad2(m) + ':' + pad2(s);
+        return m + ':' + pad2(s);
+    }
+
+    function formatViews(n) {
+        n = parseInt(n, 10);
+        if (isNaN(n) || n < 0) return '';
+        if (n >= 1000000000) return (n / 1000000000).toFixed(1).replace('.0', '') + ' млрд';
+        if (n >= 1000000) return (n / 1000000).toFixed(1).replace('.0', '') + ' млн';
+        if (n >= 1000) return (n / 1000).toFixed(1).replace('.0', '') + ' тыс';
+        return '' + n;
+    }
+
+    function formatDate(value) {
+        if (!value) return '';
+        var date;
+        if (typeof value === 'number') {
+            date = new Date(value > 9999999999 ? value : value * 1000);
+        } else if (typeof value === 'string' && /^\d+$/.test(value)) {
+            var num = parseInt(value, 10);
+            date = new Date(num > 9999999999 ? num : num * 1000);
+        } else if (typeof value === 'string') {
+            return value;
+        } else {
+            return '';
+        }
+        if (isNaN(date.getTime())) return typeof value === 'string' ? value : '';
+        var months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+        return date.getDate() + ' ' + months[date.getMonth()] + ' ' + date.getFullYear();
+    }
+
+    function extractVideoId(url) {
+        if (!url) return '';
+        var m = url.match(/[?&]v=([^&]+)/);
+        if (m) return m[1];
+        var parts = url.split('/');
+        return parts[parts.length - 1];
+    }
+
+    function extractChannelId(url) {
+        if (!url) return '';
+        var m = url.match(/\/channel\/([^?\/]+)/);
+        if (m) return m[1];
+        m = url.match(/\/c\/([^?\/]+)/);
+        if (m) return m[1];
+        m = url.match(/\/user\/([^?\/]+)/);
+        if (m) return m[1];
+        var parts = url.split('/');
+        return parts[parts.length - 1];
+    }
+
+    function extractPlaylistId(url) {
+        if (!url) return '';
+        var m = url.match(/[?&]list=([^&]+)/);
+        if (m) return m[1];
+        var parts = url.split('/');
+        return parts[parts.length - 1];
+    }
+
+    function absUrl(url, backend) {
+        if (!url) return '';
+        if (url.indexOf('//') === 0) return 'https:' + url;
+        if (url.indexOf('http') === 0) return url;
+        var instances = getInstances(backend || 'piped');
+        return instances[0] + url;
+    }
+
+    function bestThumb(arr) {
+        if (!arr || !arr.length) return '';
+        var sorted = arr.slice().sort(function (a, b) {
+            return (b.width || 0) - (a.width || 0);
+        });
+        return sorted[0].url || '';
+    }
+
+    function noty(text) { Lampa.Noty.show(text); }
+
+    function normalizeStreamPiped(raw) {
+        return {
+            kind: 'video',
+            id: extractVideoId(raw.url || ''),
+            title: raw.title || '',
+            thumbnail: raw.thumbnail || '',
+            channel: raw.uploaderName || raw.uploader || '',
+            channelId: extractChannelId(raw.uploaderUrl || ''),
+            duration: raw.duration || 0,
+            views: raw.views || 0,
+            date: raw.uploadedDate || raw.uploaded || ''
+        };
+    }
+
+    function normalizeChannelPiped(raw) {
+        return {
+            kind: 'channel',
+            id: extractChannelId(raw.url || raw.id || ''),
+            title: raw.name || '',
+            thumbnail: raw.thumbnail || raw.avatarUrl || '',
+            subscribers: raw.subscribers || raw.subscriberCount || 0
+        };
+    }
+
+    function normalizePlaylistPiped(raw) {
+        return {
+            kind: 'playlist',
+            id: extractPlaylistId(raw.url || raw.id || ''),
+            title: raw.name || raw.title || '',
+            thumbnail: raw.thumbnail || raw.thumbnailUrl || '',
+            channel: raw.uploaderName || raw.uploader || '',
+            count: raw.videos || 0
+        };
+    }
+
+    function normalizeSearchPiped(raw) {
+        if (raw.type === 'channel') return normalizeChannelPiped(raw);
+        if (raw.type === 'playlist') return normalizePlaylistPiped(raw);
+        return normalizeStreamPiped(raw);
+    }
+
+    function normalizeStreamInvidious(raw) {
+        return {
+            kind: 'video',
+            id: raw.videoId || '',
+            title: raw.title || '',
+            thumbnail: bestThumb(raw.videoThumbnails),
+            channel: raw.author || '',
+            channelId: raw.authorId || '',
+            duration: raw.lengthSeconds || 0,
+            views: raw.viewCount || 0,
+            date: raw.published || raw.publishedText || ''
+        };
+    }
+
+    function normalizeChannelInvidious(raw) {
+        return {
+            kind: 'channel',
+            id: raw.authorId || raw.channelId || '',
+            title: raw.author || '',
+            thumbnail: bestThumb(raw.authorThumbnails),
+            subscribers: raw.subCount || 0
+        };
+    }
+
+    function normalizePlaylistInvidious(raw) {
+        return {
+            kind: 'playlist',
+            id: raw.playlistId || '',
+            title: raw.title || '',
+            thumbnail: raw.playlistThumbnail || bestThumb(raw.videoThumbnails) || '',
+            channel: raw.author || '',
+            count: raw.videoCount || 0
+        };
+    }
+
+    function normalizeSearchInvidious(raw) {
+        if (raw.type === 'channel') return normalizeChannelInvidious(raw);
+        if (raw.type === 'playlist') return normalizePlaylistInvidious(raw);
+        return normalizeStreamInvidious(raw);
+    }
+
+    function normalizeItem(backend, raw, is_search) {
+        if (backend === 'invidious') return is_search ? normalizeSearchInvidious(raw) : normalizeStreamInvidious(raw);
+        return is_search ? normalizeSearchPiped(raw) : normalizeStreamPiped(raw);
+    }
+
+    function convertPipedStreams(data) {
+        var quality_map = {};
+        var video_streams = data.videoStreams || [];
+        var progressive = [];
+        video_streams.forEach(function (v) {
+            if (v.videoOnly === false && v.url) progressive.push({ url: v.url, height: v.height || 0, label: v.quality || (v.height ? v.height + 'p' : '') });
+        });
+        progressive.sort(function (a, b) { return b.height - a.height; });
+        progressive.forEach(function (p) {
+            if (!quality_map[p.label]) quality_map[p.label] = p.url;
+        });
+        var related = (data.relatedStreams || []).map(function (r) { return normalizeStreamPiped(r); });
+        return {
+            backend: 'piped',
+            title: data.title || '',
+            description: data.description || '',
+            uploader: data.uploader || '',
+            uploaderId: extractChannelId(data.uploaderUrl || ''),
+            uploaderAvatar: data.uploaderAvatar || '',
+            uploaderSubscriberCount: data.uploaderSubscriberCount || 0,
+            views: data.views || 0,
+            likes: data.likes || 0,
+            dislikes: data.dislikes || 0,
+            duration: data.duration || 0,
+            uploadDate: data.uploadDate || '',
+            thumbnailUrl: data.thumbnailUrl || '',
+            hls: data.hls || '',
+            progressive: progressive,
+            quality_map: quality_map,
+            related: related
+        };
+    }
+
+    function convertInvidiousStreams(data) {
+        var quality_map = {};
+        var progressive = [];
+        (data.formatStreams || []).forEach(function (v) {
+            if (v.url) {
+                var height = 0;
+                if (v.resolution) {
+                    var m = v.resolution.match(/(\d+)p?/);
+                    if (m) height = parseInt(m[1], 10);
+                }
+                progressive.push({ url: v.url, height: height, label: v.qualityLabel || (height ? height + 'p' : '') });
+            }
+        });
+        progressive.sort(function (a, b) { return b.height - a.height; });
+        progressive.forEach(function (p) {
+            if (!quality_map[p.label]) quality_map[p.label] = p.url;
+        });
+        var related = (data.recommendedVideos || []).map(function (r) { return normalizeStreamInvidious(r); });
+        return {
+            backend: 'invidious',
+            title: data.title || '',
+            description: data.description || '',
+            uploader: data.author || '',
+            uploaderId: data.authorId || '',
+            uploaderAvatar: bestThumb(data.authorThumbnails),
+            uploaderSubscriberCount: data.subCountText || data.subCount || 0,
+            views: data.viewCount || 0,
+            likes: data.likeCount || 0,
+            dislikes: data.dislikeCount || 0,
+            duration: data.lengthSeconds || 0,
+            uploadDate: data.published || '',
+            thumbnailUrl: bestThumb(data.videoThumbnails),
+            hls: data.hlsUrl || '',
+            progressive: progressive,
+            quality_map: quality_map,
+            related: related
+        };
+    }
+
+    function convertStreams(result) {
+        if (result.backend === 'invidious') return convertInvidiousStreams(result.data);
+        return convertPipedStreams(result.data);
+    }
+
+    function pickBestStreamUrl(unified) {
+        var ladder = [2160, 1440, 1080, 720, 480];
+        var pref = Lampa.Storage.get(STORAGE_QUALITY, 'auto') || 'auto';
+        var result = { url: '', quality: unified.quality_map || {} };
+
+        if (unified.hls) {
+            result.url = unified.hls;
+            return result;
+        }
+
+        var list = unified.progressive || [];
+        if (!list.length) return result;
+
+        if (pref === 'auto') {
+            result.url = list[0].url;
+            return result;
+        }
+
+        var pref_height = parseInt(pref, 10);
+        var start_index = ladder.indexOf(pref_height);
+        if (start_index === -1) start_index = 0;
+
+        for (var i = start_index; i < ladder.length; i++) {
+            var target = ladder[i];
+            for (var j = 0; j < list.length; j++) {
+                if (list[j].height === target) {
+                    result.url = list[j].url;
+                    return result;
+                }
+            }
+        }
+
+        result.url = list[0].url;
+        return result;
+    }
+
+    function getHistory() { return jsonList(STORAGE_HISTORY, []); }
+
+    function addHistory(item) {
+        var list = getHistory().filter(function (i) { return i.id !== item.id; });
+        list.unshift({ id: item.id, title: item.title, thumbnail: item.thumbnail, channel: item.ch  async function search(q) {
     var c = cache_get();
     if (c['s_' + q]) return c['s_' + q];
 
