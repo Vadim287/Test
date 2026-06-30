@@ -2,54 +2,32 @@
 
   var ID = 'youtube';
 
-  var piped_list = [
+  var PIPED = [
     'https://pipedapi.kavin.rocks',
     'https://pipedapi.adminforge.de',
     'https://pipedapi.syncpundit.io'
   ];
 
-  var inv_list = [
+  var INV = [
     'https://inv.nadeko.net'
   ];
 
-  var store = {
-    cache: ID + '_cache',
-    history: ID + '_history',
-    fav: ID + '_fav',
-    settings: ID + '_settings'
-  };
-
-  function ls(key, def) {
-    try {
-      var v = localStorage.getItem(key);
-      return v ? JSON.parse(v) : def;
-    } catch (e) {
-      return def;
+  function storage(key, val) {
+    if (val === undefined) {
+      try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; }
     }
-  }
-
-  function ss(key, val) {
     localStorage.setItem(key, JSON.stringify(val));
   }
 
   function settings() {
     return Object.assign({
-      backend: 'auto',
       piped: 0,
       inv: 0,
-      quality: 'auto'
-    }, ls(store.settings, {}));
+      backend: 'auto'
+    }, storage(ID + '_settings') || {});
   }
 
-  function cache_get() {
-    return ls(store.cache, {});
-  }
-
-  function cache_set(v) {
-    ss(store.cache, v);
-  }
-
-  function request(url) {
+  function req(url) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', url, true);
@@ -69,17 +47,17 @@
     });
   }
 
-  function piped() {
+  function piped_base() {
     var s = settings();
-    return piped_list[s.piped] || piped_list[0];
+    return PIPED[s.piped] || PIPED[0];
   }
 
-  function inv() {
+  function inv_base() {
     var s = settings();
-    return inv_list[s.inv] || inv_list[0];
+    return INV[s.inv] || INV[0];
   }
 
-  function map_item(v) {
+  function map(v) {
     return {
       id: v.videoId || v.id,
       title: v.title,
@@ -89,23 +67,142 @@
   }
 
   function search(q) {
-    var c = cache_get();
-    if (c['s_' + q]) return Promise.resolve(c['s_' + q]);
-
-    return request(piped() + '/search?q=' + encodeURIComponent(q))
+    return req(piped_base() + '/search?q=' + encodeURIComponent(q))
       .then(function (r) {
-        var res = (r.items || r).map(map_item);
-        c['s_' + q] = res;
-        cache_set(c);
-        return res;
+        return (r.items || r).map(map);
       })
       .catch(function () {
-        return request(inv() + '/api/v1/search?q=' + encodeURIComponent(q))
+        return req(inv_base() + '/api/v1/search?q=' + encodeURIComponent(q))
           .then(function (r) {
-            var res = r.map(map_item);
-            c['s_' + q] = res;
-            cache_set(c);
-            return res;
+            return r.map(map);
+          });
+      });
+  }
+
+  function trending() {
+    return req(piped_base() + '/trending')
+      .then(function (r) {
+        return (r.items || r).map(map);
+      })
+      .catch(function () {
+        return req(inv_base() + '/api/v1/trending')
+          .then(function (r) {
+            return r.map(map);
+          });
+      });
+  }
+
+  function video(id) {
+    return req(piped_base() + '/streams/' + id)
+      .catch(function () {
+        return req(inv_base() + '/api/v1/videos/' + id);
+      });
+  }
+
+  function open(item) {
+    Lampa.Activity.push({
+      title: item.title,
+      component: 'youtube_view',
+      page: item
+    });
+  }
+
+  function list() {
+
+    return function () {
+
+      var html = Lampa.Template.get('activity', {
+        title: 'YouTube'
+      });
+
+      var body = $('<div class="youtube-list"></div>');
+
+      html.find('.activity__content').append(body);
+
+      trending().then(function (items) {
+
+        body.empty();
+
+        items.forEach(function (v) {
+
+          var el = $('<div class="youtube-card"></div>');
+
+          el.append('<img src="' + v.img + '">');
+          el.append('<div class="youtube-title">' + v.title + '</div>');
+
+          el.on('click', function () {
+            open(v);
+          });
+
+          body.append(el);
+
+        });
+
+      });
+
+      return html;
+    };
+  }
+
+  function view() {
+
+    return function (data) {
+
+      var v = data.page;
+
+      var html = Lampa.Template.get('activity', {
+        title: v.title
+      });
+
+      var body = $('<div class="youtube-view"></div>');
+
+      html.find('.activity__content').append(body);
+
+      video(v.id).then(function (r) {
+
+        var streams = (r.videoStreams || r.formatStreams || []);
+        var url = streams.length ? streams[0].url : null;
+
+        if (url) {
+          Lampa.Player.play({
+            url: url,
+            title: v.title
+          });
+        }
+
+      });
+
+      return html;
+    };
+  }
+
+  function init() {
+
+    Lampa.Component.add('youtube_list', list());
+    Lampa.Component.add('youtube_view', view());
+
+    Lampa.Menu.add({
+      id: 'youtube',
+      title: 'YouTube',
+      icon: 'youtube',
+      onSelect: function () {
+        Lampa.Activity.push({
+          title: 'YouTube',
+          component: 'youtube_list'
+        });
+      }
+    });
+
+  }
+
+  if (window.appready) init();
+  else {
+    Lampa.Listener.follow('app', function (e) {
+      if (e.type === 'ready') init();
+    });
+  }
+
+})();            return res;
           });
       });
   }
