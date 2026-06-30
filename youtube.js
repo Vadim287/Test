@@ -1,110 +1,252 @@
 (function () {
-    'use strict';
 
-    if (window.youtube_dual_plugin_installed) return;
-    window.youtube_dual_plugin_installed = true;
+  var ID = 'youtube';
 
-    var BACKEND_INSTANCES = {
-        piped: [
-            'https://pipedapi.kavin.rocks',
-            'https://pipedapi.adminforge.de',
-            'https://pipedapi.syncpundit.io'
-        ],
-        invidious: [
-            'https://inv.nadeko.net'
-        ]
+  var piped_list = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.syncpundit.io'
+  ];
+
+  var inv_list = [
+    'https://inv.nadeko.net'
+  ];
+
+  var store = {
+    cache: ID + '_cache',
+    history: ID + '_history',
+    fav: ID + '_fav',
+    settings: ID + '_settings'
+  };
+
+  function ls(key, def) {
+    try {
+      var v = localStorage.getItem(key);
+      return v ? JSON.parse(v) : def;
+    } catch (e) {
+      return def;
+    }
+  }
+
+  function ss(key, val) {
+    localStorage.setItem(key, JSON.stringify(val));
+  }
+
+  function settings() {
+    return Object.assign({
+      backend: 'auto',
+      piped: 0,
+      inv: 0,
+      quality: 'auto'
+    }, ls(store.settings, {}));
+  }
+
+  function cache_get() {
+    return ls(store.cache, {});
+  }
+
+  function cache_set(v) {
+    ss(store.cache, v);
+  }
+
+  function request(url) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.timeout = 12000;
+
+      xhr.onload = function () {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (e) {
+          reject(e);
+        }
+      };
+
+      xhr.onerror = reject;
+      xhr.ontimeout = reject;
+      xhr.send();
+    });
+  }
+
+  function piped() {
+    var s = settings();
+    return piped_list[s.piped] || piped_list[0];
+  }
+
+  function inv() {
+    var s = settings();
+    return inv_list[s.inv] || inv_list[0];
+  }
+
+  function map_item(v) {
+    return {
+      id: v.videoId || v.id,
+      title: v.title,
+      subtitle: v.uploaderName || v.author,
+      img: v.thumbnail || (v.videoThumbnails && v.videoThumbnails[0].url)
     };
+  }
 
-    var STORAGE_BACKEND = 'youtube_backend_mode';
-    var STORAGE_PIPED_CUSTOM = 'youtube_piped_custom';
-    var STORAGE_INVIDIOUS_CUSTOM = 'youtube_invidious_custom';
-    var STORAGE_REGION = 'youtube_region';
-    var STORAGE_QUALITY = 'youtube_quality';
-    var STORAGE_CACHE_SIZE = 'youtube_cache_size';
-    var STORAGE_CACHE_STORE = 'youtube_cache_store_v1';
-    var STORAGE_HISTORY = 'youtube_history';
-    var STORAGE_FAVORITES = 'youtube_favorites';
-    var STORAGE_SUBSCRIPTIONS = 'youtube_subscriptions';
-    var STORAGE_PLAYLISTS = 'youtube_playlists_local';
-    var STORAGE_LAST_WATCHED = 'youtube_last_watched';
+  function search(q) {
+    var c = cache_get();
+    if (c['s_' + q]) return Promise.resolve(c['s_' + q]);
 
-    var CACHE_TTL = 5 * 60 * 1000;
-    var REQUEST_TIMEOUT = 10000;
-    var RETRIES_PER_INSTANCE = 3;
+    return request(piped() + '/search?q=' + encodeURIComponent(q))
+      .then(function (r) {
+        var res = (r.items || r).map(map_item);
+        c['s_' + q] = res;
+        cache_set(c);
+        return res;
+      })
+      .catch(function () {
+        return request(inv() + '/api/v1/search?q=' + encodeURIComponent(q))
+          .then(function (r) {
+            var res = r.map(map_item);
+            c['s_' + q] = res;
+            cache_set(c);
+            return res;
+          });
+      });
+  }
 
-    function nowTime() { return new Date().getTime(); }
+  function trending() {
+    var c = cache_get();
+    if (c.t) return Promise.resolve(c.t);
 
-    function loadCacheStore() {
-        try {
-            var raw = Lampa.Storage.get(STORAGE_CACHE_STORE, '{}');
-            var parsed = JSON.parse(raw);
-            return parsed && typeof parsed === 'object' ? parsed : {};
-        } catch (e) {
-            return {};
-        }
-    }
+    return request(piped() + '/trending')
+      .then(function (r) {
+        var res = (r.items || r).map(map_item);
+        c.t = res;
+        cache_set(c);
+        return res;
+      })
+      .catch(function () {
+        return request(inv() + '/api/v1/trending')
+          .then(function (r) {
+            var res = r.map(map_item);
+            c.t = res;
+            cache_set(c);
+            return res;
+          });
+      });
+  }
 
-    function saveCacheStore(store) {
-        try {
-            Lampa.Storage.set(STORAGE_CACHE_STORE, JSON.stringify(store));
-        } catch (e) {}
-    }
+  function open(item) {
+    Lampa.Activity.push({
+      title: item.title,
+      component: 'youtube_view',
+      page: item
+    });
+  }
 
-    function cacheGet(key) {
-        var store = loadCacheStore();
-        var entry = store[key];
-        if (!entry) return null;
-        if (nowTime() - entry.t > CACHE_TTL) {
-            delete store[key];
-            saveCacheStore(store);
-            return null;
-        }
-        return entry.d;
-    }
+  function component_list(type) {
+    return function () {
 
-    function cacheSet(key, data) {
-        var store = loadCacheStore();
-        store[key] = { t: nowTime(), d: data };
-        var keys = Object.keys(store);
-        var limit = parseInt(Lampa.Storage.get(STORAGE_CACHE_SIZE, '50'), 10) || 50;
-        if (keys.length > limit) {
-            keys.sort(function (a, b) { return store[a].t - store[b].t; });
-            while (keys.length > limit) {
-                var k = keys.shift();
-                delete store[k];
-            }
-        }
-        saveCacheStore(store);
-    }
+      var html = Lampa.Template.get('activity', { title: 'YouTube' });
+      var body = $('<div class="youtube"></div>');
 
-    function cacheReset() {
-        saveCacheStore({});
-    }
+      html.find('.activity__content').append(body);
 
-    function jsonList(key, def) {
-        var raw = Lampa.Storage.get(key, '');
-        if (!raw) return def || [];
-        try {
-            var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            if (!parsed || !parsed.length) return def || [];
-            return parsed;
-        } catch (e) {
-            return def || [];
-        }
-    }
+      function render(items) {
+        body.empty();
 
-    function jsonSave(key, value) {
-        Lampa.Storage.set(key, JSON.stringify(value));
-    }
+        items.forEach(function (v) {
+          var el = $('<div class="yt-item"></div>');
 
-    function jsonObj(key, def) {
-        var raw = Lampa.Storage.get(key, '');
-        if (!raw) return def || null;
-        try {
-            return JSON.parse(raw);
-        } catch (e) {
-            return def || null;
-        }
+          el.append('<div class="img"><img src="' + v.img + '"></div>');
+          el.append('<div class="title">' + v.title + '</div>');
+
+          el.on('click', function () {
+            open(v);
+          });
+
+          body.append(el);
+        });
+      }
+
+      if (type === 'trending') {
+        trending().then(render);
+      }
+
+      return html;
+    };
+  }
+
+  function component_search() {
+    return function () {
+
+      var html = Lampa.Template.get('activity', { title: 'YouTube Search' });
+      var body = $('<div class="youtube-search"></div>');
+      var input = $('<input class="yt-input" placeholder="Search">');
+
+      input.on('change', function () {
+        search(input.val()).then(function (r) {
+          body.find('.res').remove();
+          var grid = $('<div class="res"></div>');
+          r.forEach(function (v) {
+            var el = $('<div class="yt-item"></div>');
+            el.text(v.title);
+            el.on('click', function () {
+              open(v);
+            });
+            grid.append(el);
+          });
+          body.append(grid);
+        });
+      });
+
+      body.append(input);
+      html.find('.activity__content').append(body);
+
+      return html;
+    };
+  }
+
+  function component_view() {
+    return function (data) {
+
+      var v = data.page;
+
+      var html = Lampa.Template.get('activity', { title: v.title });
+      var body = $('<div class="youtube-view"></div>');
+
+      body.append('<div class="title">' + v.title + '</div>');
+
+      html.find('.activity__content').append(body);
+
+      return html;
+    };
+  }
+
+  function init() {
+
+    Lampa.Component.add('youtube_trending', component_list('trending'));
+    Lampa.Component.add('youtube_search', component_search());
+    Lampa.Component.add('youtube_view', component_view());
+
+    Lampa.Menu.add({
+      id: 'youtube',
+      title: 'YouTube',
+      icon: 'youtube',
+      onSelect: function () {
+        Lampa.Activity.push({
+          title: 'YouTube',
+          component: 'youtube_trending'
+        });
+      }
+    });
+
+  }
+
+  if (window.appready) init();
+  else {
+    Lampa.Listener.follow('app', function (e) {
+      if (e.type === 'ready') init();
+    });
+  }
+
+})();        }
     }
 
     function getInstances(backend) {
