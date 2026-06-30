@@ -1,110 +1,140 @@
 (function () {
+    'use strict';
 
-  var ID = 'youtube';
-
-  var PIPED = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.adminforge.de',
-    'https://pipedapi.syncpundit.io'
-  ];
-
-  var INV = [
-    'https://inv.nadeko.net'
-  ];
-
-  function storage(key, val) {
-    if (val === undefined) {
-      try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; }
-    }
-    localStorage.setItem(key, JSON.stringify(val));
-  }
-
-  function settings() {
-    return Object.assign({
-      piped: 0,
-      inv: 0,
-      backend: 'auto'
-    }, storage(ID + '_settings') || {});
-  }
-
-  function req(url) {
-    return new Promise(function (resolve, reject) {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', url, true);
-      xhr.timeout = 12000;
-
-      xhr.onload = function () {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch (e) {
-          reject(e);
-        }
-      };
-
-      xhr.onerror = reject;
-      xhr.ontimeout = reject;
-      xhr.send();
-    });
-  }
-
-  function piped_base() {
-    var s = settings();
-    return PIPED[s.piped] || PIPED[0];
-  }
-
-  function inv_base() {
-    var s = settings();
-    return INV[s.inv] || INV[0];
-  }
-
-  function map(v) {
-    return {
-      id: v.videoId || v.id,
-      title: v.title,
-      subtitle: v.uploaderName || v.author,
-      img: v.thumbnail || (v.videoThumbnails && v.videoThumbnails[0].url)
+    // КОНФИГУРАЦИЯ
+    const CONFIG = {
+        // Список зеркал Piped. Если один не работает, можно переключить.
+        api: 'https://pipedapi.kavin.rocks', 
+        // Альтернативы: https://api.piped.yt, https://pipedapi.adminforge.de
+        title: 'YouTube (Piped)',
+        icon: '<svg viewBox="0 0 24 24" fill="#FF0000"><path d="M19.615 3.184c-3.604-.246-11.631-.245-15.23 0-3.897.266-4.356 2.62-4.385 8.816.029 6.185.484 8.549 4.385 8.816 3.6.245 11.626.246 15.23 0 3.897-.266 4.356-2.62 4.385-8.816-.029-6.185-.484-8.549-4.385-8.816zm-10.615 12.816v-8l8 3.993-8 4.007z"/></svg>'
     };
-  }
 
-  function search(q) {
-    return req(piped_base() + '/search?q=' + encodeURIComponent(q))
-      .then(function (r) {
-        return (r.items || r).map(map);
-      })
-      .catch(function () {
-        return req(inv_base() + '/api/v1/search?q=' + encodeURIComponent(q))
-          .then(function (r) {
-            return r.map(map);
-          });
-      });
-  }
+    // Утилита для запросов
+    async function request(url) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.json();
+        } catch (e) {
+            console.error('[YouTube Piped]', e);
+            Lampa.Noty.show('Ошибка запроса к Piped API');
+            return null;
+        }
+    }
 
-  function trending() {
-    return req(piped_base() + '/trending')
-      .then(function (r) {
-        return (r.items || r).map(map);
-      })
-      .catch(function () {
-        return req(inv_base() + '/api/v1/trending')
-          .then(function (r) {
-            return r.map(map);
-          });
-      });
-  }
+    // Форматирование длительности (секунды -> HH:MM:SS)
+    function formatTime(seconds) {
+        if (!seconds) return '';
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = seconds % 60;
+        if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+        return `${m}:${s < 10 ? '0' : ''}${s}`;
+    }
 
-  function video(id) {
-    return req(piped_base() + '/streams/' + id)
-      .catch(function () {
-        return req(inv_base() + '/api/v1/videos/' + id);
-      });
-  }
+    // Основной класс источника
+    class YouTubePipedSource {
+        constructor() {
+            this.id = 'youtube_piped';
+            this.title = CONFIG.title;
+        }
 
-  function open(item) {
-    Lampa.Activity.push({
-      title: item.title,
-      component: 'youtube_view',
-      page: item
-    });
+        // Метод поиска (вызывается Lampa)
+        async search(query, params = {}) {
+            const url = `${CONFIG.api}/search?q=${encodeURIComponent(query)}&filter=videos`;
+            const data = await request(url);
+
+            if (!data || !data.items) return { results: [] };
+
+            const results = data.items.map(item => ({
+                id: item.url?.replace('/watch?v=', ''),
+                title: item.title,
+                original_title: item.title,
+                description: item.description || '',
+                poster: item.thumbnail,
+                quality: item.duration > 0 ? formatTime(item.duration) : '',
+                info: item.uploaderName ? `👤 ${item.uploaderName} | 👁 ${(item.views || 0).toLocaleString()}` : '',
+                url: item.url, // Сохраняем оригинальный URL для парсинга потока
+                source: this.id
+            }));
+
+            return { results };
+        }
+
+        // Получение прямых ссылок на видео (стримов)
+        async getStream(videoId) {
+            const url = `${CONFIG.api}/streams/${videoId}`;
+            const data = await request(url);
+
+            if (!data) return null;
+
+            // Формируем список доступных качеств
+            const streams = [];
+            
+            // Видео + Аудио (обычно до 720p у Piped)
+            if (data.videoStreams) {
+                data.videoStreams.forEach(s => {
+                    if (s.videoOnly === false && s.url) {
+                        streams.push({
+                            quality: s.quality || s.resolution,
+                            url: s.url,
+                            codec: s.codec,
+                            filesize: s.bitrate
+                        });
+                    }
+                });
+            }
+
+            // Сортировка по качеству
+            streams.sort((a, b) => parseInt(b.quality) - parseInt(a.quality));
+
+            return {
+                title: data.title,
+                description: data.description,
+                poster: data.thumbnailUrl,
+                streams: streams.length > 0 ? streams : [{ quality: 'Auto', url: data.hls || data.dash }],
+                subtitles: data.subtitles?.map(sub => ({
+                    label: sub.name || sub.code,
+                    url: sub.url,
+                    type: 'vtt'
+                })) || []
+            };
+        }
+    }
+
+    // РЕГИСТРАЦИЯ В LAMPA
+    function init() {
+        const source = new YouTubePipedSource();
+
+        // Регистрируем как источник контента
+        Lampa.Sources.add(source);
+
+        // Добавляем кнопку в главное меню
+        Lampa.MainMenu.add({
+            id: source.id,
+            title: source.title,
+            icon: CONFIG.icon,
+            onSelect: () => {
+                Lampa.Activity.push({
+                    url: '',
+                    title: source.title,
+                    component: 'search', // Используем встроенный компонент поиска
+                    source: source.id
+                });
+            }
+        });
+
+        console.log(`[Plugin] ${source.title} loaded successfully`);
+    }
+
+    // Запуск при готовности Lampa
+    if (typeof Lampa !== 'undefined') {
+        init();
+    } else {
+        document.addEventListener('lampa_ready', init);
+    }
+})();    });
   }
 
   function list() {
